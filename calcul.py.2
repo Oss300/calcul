@@ -1,12 +1,15 @@
 
 
+
 """
 Calculadora de Tabla de Verdad + Procedimiento con Leyes Lógicas
 Ejecutar con:  streamlit run calculadora_completa.py
 """
+import heapq
 import html
 import itertools
 import re
+import time
 
 import pandas as pd
 import streamlit as st
@@ -528,6 +531,102 @@ def derivar(arbol, max_pasos=80):
     return [(ley, nodo) for ley, nodo, _, _ in derivar_detalle(arbol, max_pasos)]
 
 
+# --- Búsqueda del camino más corto ------------------------------
+# derivar_detalle sigue un orden fijo (clásico: quitar flechas, mover
+# negaciones, simplificar). Aquí se prueban TODAS las formas de aplicar una ley
+# en cualquier parte y se elige la secuencia con menos pasos hasta el resultado.
+def _tamano(n):
+    return 1 if n[0] in ("var", "const") else 1 + sum(_tamano(h) for h in n[1:])
+
+
+def _objetivo(arbol):
+    """1 si es tautología, 0 si es contradicción, None si es contingencia."""
+    vs = variables(arbol)
+    if len(vs) > 8:
+        return None
+    r = [evaluar(arbol, dict(zip(vs, v))) for v in itertools.product([True, False], repeat=len(vs))]
+    if all(r):
+        return ("const", True)
+    if not any(r):
+        return ("const", False)
+    return None
+
+
+def _aplicaciones(nodo, g):
+    """Todas las formas de aplicar UNA ley del grupo g, en cualquier parte del nodo."""
+    if nodo[0] not in ("var", "const"):
+        for i in range(1, len(nodo)):
+            for hijo, ley, antes, despues in _aplicaciones(nodo[i], g):
+                yield nodo[:i] + (hijo,) + nodo[i + 1:], ley, antes, despues
+    for regla in GRUPOS[g]:
+        r = regla(nodo)
+        if r:
+            yield r[0], r[1], nodo, r[0]
+
+
+def derivar_corto(arbol, max_estados=4000, max_pasos=30, limite_seg=1.5):
+    """Camino con menos pasos (mismo formato que derivar_detalle).
+    Si la expresión es tautología/contradicción el destino es 1/0; si no, la
+    expresión más pequeña que se alcance. Un pequeño costo extra desempata a
+    favor de las leyes de simplificación sobre los reagrupamientos."""
+    objetivo = _objetivo(arbol)
+    inicio = _canon(arbol)
+    cont = itertools.count()
+    heap = [(0.0, 0, next(cont), arbol)]
+    dist = {inicio: 0.0}
+    padre = {inicio: None}
+    mejor = (_tamano(arbol), 0.0, inicio)
+    meta = None
+    expandidos = 0
+    tam_max = 3 * _tamano(arbol) + 10  # no explorar expresiones que se disparan de tamaño
+    limite = time.monotonic() + limite_seg
+    while heap and expandidos < max_estados and time.monotonic() < limite:
+        coste, pasos, _, nodo = heapq.heappop(heap)
+        clave = _canon(nodo)
+        if coste > dist[clave]:
+            continue  # entrada vieja: ya se llegó aquí por un camino mejor
+        if objetivo is not None and nodo == objetivo:
+            meta = clave
+            break
+        cand = (_tamano(nodo), coste, clave)
+        if cand[:2] < mejor[:2]:
+            mejor = cand
+        expandidos += 1
+        if pasos >= max_pasos:
+            continue
+        for g in range(len(GRUPOS)):
+            for nuevo, ley, antes, despues in _aplicaciones(nodo, g):
+                if _tamano(nuevo) > tam_max:
+                    continue
+                k = _canon(nuevo)
+                c = coste + 1 + 0.01 * g
+                if k not in dist or c < dist[k]:
+                    dist[k] = c
+                    padre[k] = (clave, ley, antes, despues, nuevo)
+                    heapq.heappush(heap, (c, pasos + 1, next(cont), nuevo))
+    meta = meta or mejor[2]
+    camino = []
+    k = meta
+    while padre[k] is not None:
+        previa, ley, antes, despues, nuevo = padre[k]
+        camino.append((ley, nuevo, antes, despues))
+        k = previa
+    return [(None, arbol, None, None)] + camino[::-1]
+
+
+def derivar_mejor(arbol):
+    """El camino más corto; si el clásico es igual de bueno, se queda con el clásico."""
+    clasico = derivar_detalle(arbol)
+    try:
+        corto = derivar_corto(arbol)
+    except Exception:  # por seguridad: nunca dejar sin respuesta
+        return clasico
+    tam_c, tam_k = _tamano(clasico[-1][1]), _tamano(corto[-1][1])
+    if tam_k < tam_c or (tam_k == tam_c and len(corto) < len(clasico)):
+        return corto
+    return clasico
+
+
 # ============================================================
 # 2b. REFERENCIA Y EXPLICACIÓN DE LAS LEYES
 # ============================================================
@@ -624,7 +723,7 @@ def explicar_paso(ley, antes, despues):
             f"{POR_QUE.get(nombre, '')} Queda «{a_texto(despues)}».")
 
 
-def explicar_procedimiento(pasos):
+def explicar_procedimiento(pasos, camino_corto=False):
     """Resumen en una o dos frases de todo el procedimiento."""
     n = len(pasos) - 1
     if n == 0:
@@ -637,9 +736,12 @@ def explicar_procedimiento(pasos):
         cierre = "El resultado es 0, así que la expresión es una contradicción."
     else:
         cierre = f"La forma simplificada es «{a_texto(final)}»."
+    metodo = ("Se eligió el camino con menos pasos entre todas las leyes aplicables."
+              if camino_corto else
+              "Primero se eliminan ↔, ⊕ y →, luego se llevan las negaciones hacia adentro y "
+              "después se simplifica.")
     return (f"Se necesitaron {n} paso{'s' if n != 1 else ''} usando: {', '.join(leyes)}. "
-            f"Primero se eliminan ↔, ⊕ y →, luego se llevan las negaciones hacia adentro y "
-            f"después se simplifica. {cierre}")
+            f"{metodo} {cierre}")
 
 
 # ============================================================
@@ -766,8 +868,8 @@ def tabla_referencia(usadas=()):
             + "".join(filas) + "</tbody></table>")
 
 
-def mostrar_procedimiento(arbol, original, explicar=True):
-    detalle = derivar_detalle(arbol)
+def mostrar_procedimiento(arbol, original, explicar=True, camino_corto=False):
+    detalle = derivar_mejor(arbol) if camino_corto else derivar_detalle(arbol)
     pasos = [(ley, nodo) for ley, nodo, _, _ in detalle]
     final = pasos[-1][1]
     if final == ("const", True):
@@ -779,7 +881,8 @@ def mostrar_procedimiento(arbol, original, explicar=True):
 
     if explicar:
         st.markdown(f'<div class="resumen">🧭 <b>Resumen:</b> '
-                    f'{html.escape(explicar_procedimiento(pasos))}</div>', unsafe_allow_html=True)
+                    f'{html.escape(explicar_procedimiento(pasos, camino_corto))}</div>',
+                    unsafe_allow_html=True)
 
     tarjetas = []
     for i, (ley, nodo, antes, despues) in enumerate(detalle):
@@ -926,6 +1029,7 @@ def main():
         teclado()
         mostrar_pasos = st.checkbox("Mostrar subexpresiones en la tabla de verdad", value=True)
         explicar = st.checkbox("💡 Explicar cada paso del procedimiento", value=True)
+        corto = st.checkbox("⚡ Buscar el camino más corto (si no, método clásico fijo)", value=True)
 
         if st.button("🚀  Resolver", key="resolver"):
             if not texto:
@@ -962,9 +1066,10 @@ def main():
                             f'<div class="chips"><span class="badge {tipo[0]}">{tipo[1]}</span>{vars_html}</div>',
                             unsafe_allow_html=True)
                 tab_leyes, tab_tabla = st.tabs(["📐 Procedimiento", "📊 Tabla de verdad"])
-                usadas = leyes_usadas(derivar(arbol))
+                camino = derivar_mejor(arbol) if corto else derivar_detalle(arbol)
+                usadas = leyes_usadas(camino)
                 with tab_leyes:
-                    mostrar_procedimiento(arbol, original, explicar)
+                    mostrar_procedimiento(arbol, original, explicar, corto)
                 with tab_tabla:
                     mostrar_tabla(arbol, mostrar_pasos)
 
